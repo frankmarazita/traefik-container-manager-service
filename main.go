@@ -46,11 +46,10 @@ type Service struct {
 	isHandled bool
 }
 
-// claimHandler reports whether the caller is the goroutine responsible for
-// stopping the service, so only one stopAfterTimeout runs per service.
-func (service *Service) claimHandler() bool {
-	service.mu.Lock()
-	defer service.mu.Unlock()
+// claimLocked reports whether the caller is the goroutine responsible for
+// stopping the service, so only one stopAfterTimeout runs per service. The
+// caller must hold service.mu.
+func (service *Service) claimLocked() bool {
 	if service.isHandled {
 		return false
 	}
@@ -58,8 +57,8 @@ func (service *Service) claimHandler() bool {
 	return true
 }
 
-// releaseHandler hands responsibility back once the service has been stopped,
-// so a later request can start it again.
+// releaseHandler hands responsibility back so a later request can start the
+// service again.
 func (service *Service) releaseHandler() {
 	service.mu.Lock()
 	defer service.mu.Unlock()
@@ -179,16 +178,21 @@ func GetOrCreateService(name string, timeout uint64, host, path string, client *
 	return service, nil
 }
 
-// HandleServiceState up the service if down or set timeout for downing the service
+// HandleServiceState ups the service if down, or extends the timeout before it
+// is brought down. It holds service.mu for the whole observe-and-act sequence so
+// a request can never report the service as up while it is being stopped.
 func (service *Service) HandleServiceState(cli *client.Client) (string, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+
 	status, err := service.getStatus(cli)
-	// return "", fmt.Errorf("state: %s, %+v", status, err)
 	if err != nil {
 		return "", err
 	}
-	if status == UP {
+	switch status {
+	case UP:
 		fmt.Printf("- Service %v is up\n", service.name)
-		if service.claimHandler() {
+		if service.claimLocked() {
 			go service.stopAfterTimeout(cli)
 		}
 		select {
@@ -197,50 +201,60 @@ func (service *Service) HandleServiceState(cli *client.Client) (string, error) {
 		default:
 		}
 		return "started", nil
-	} else if status == STARTING {
+	case STARTING:
 		fmt.Printf("- Service %v is starting\n", service.name)
-		if service.claimHandler() {
+		if service.claimLocked() {
 			go service.stopAfterTimeout(cli)
 		}
 		return "starting", nil
-	} else if status == DOWN {
+	case DOWN:
 		fmt.Printf("- Service %v is down\n", service.name)
-		service.start(cli)
+		service.startLocked(cli)
 		return "starting", nil
-	} else {
+	default:
 		fmt.Printf("- Service %v status is unknown\n", service.name)
-		if err != nil {
-			return "", err
+		return "", fmt.Errorf("unknown status for service %s", service.name)
+	}
+}
+
+func statusOf(containers []containertypes.Summary) Status {
+	if len(containers) == 0 {
+		return UNKNOWN
+	}
+
+	running, restarting := 0, 0
+	for _, container := range containers {
+		switch container.State {
+		case "running":
+			running++
+		case "restarting":
+			restarting++
 		}
-		return service.HandleServiceState(cli)
+	}
+
+	switch {
+	case running == len(containers):
+		return UP
+	case restarting > 0:
+		return STARTING
+	default:
+		return DOWN
 	}
 }
 
 func (service *Service) getStatus(client *client.Client) (Status, error) {
-	ctx := context.Background()
-	var status Status = UNKNOWN
-	containers, err := service.getDockerContainers(ctx, client)
+	containers, err := service.getDockerContainers(context.Background(), client)
 	if err != nil {
-		return status, err
+		return UNKNOWN, err
 	}
-	for _, container := range containers {
-		switch container.State {
-		case "running":
-		default:
-			status = DOWN
-		}
-	}
-	if status != DOWN {
-		status = UP
-	}
-
-	return status, nil
+	return statusOf(containers), nil
 }
 
-func (service *Service) start(client *client.Client) {
+// startLocked requires the caller to hold service.mu.
+func (service *Service) startLocked(client *client.Client) {
 	fmt.Printf("Starting service %s\n", service.name)
 	service.startContainers(client)
-	if service.claimHandler() {
+	if service.claimLocked() {
 		go service.stopAfterTimeout(client)
 	}
 	select {
@@ -250,31 +264,46 @@ func (service *Service) start(client *client.Client) {
 }
 
 func (service *Service) stopAfterTimeout(client *client.Client) {
-	defer service.releaseHandler()
 	fmt.Println("In stopAfterTimeout")
 
-	if timeout, ok := <-service.time; ok {
-		fmt.Println("Sleeping", timeout)
-		time.Sleep(time.Duration(timeout) * time.Second)
-	} else {
-		fmt.Println("That should not happen, but we never know ;)")
+	timeout, ok := <-service.time
+	if !ok {
+		service.releaseHandler()
+		return
 	}
 
 	for {
-		select {
-		case timeout, ok := <-service.time:
-			if ok {
-				fmt.Println("Sleeping", timeout)
-				time.Sleep(time.Duration(timeout) * time.Second)
-			} else {
-				fmt.Println("That should not happen, but we never know ;)")
-			}
-		default:
+		fmt.Println("Sleeping", timeout)
+		time.Sleep(time.Duration(timeout) * time.Second)
+
+		extended, next := service.drainOrStop(func() {
 			fmt.Printf("Stopping service %s\n", service.name)
 			service.stopContainers(client)
+		})
+		if !extended {
 			return
 		}
+		timeout = next
 	}
+}
+
+// drainOrStop consumes a keepalive that arrived during the sleep and reports
+// that the service should stay up. If none arrived it runs stop and releases the
+// handler, both under service.mu, so a concurrent request either extends the
+// timeout before the decision is made or blocks until the service is fully down.
+func (service *Service) drainOrStop(stop func()) (bool, uint64) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+
+	select {
+	case timeout := <-service.time:
+		return true, timeout
+	default:
+	}
+
+	stop()
+	service.isHandled = false
+	return false, 0
 }
 
 func (service *Service) startContainers(client *client.Client) error {

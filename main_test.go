@@ -127,7 +127,7 @@ func TestGetOrCreateServiceReturnsSameInstance(t *testing.T) {
 	}
 }
 
-func TestClaimHandlerAdmitsOneGoroutine(t *testing.T) {
+func TestClaimAdmitsOneGoroutine(t *testing.T) {
 	service := &Service{name: "claimed", time: make(chan uint64, 1)}
 
 	var claims int64
@@ -136,7 +136,9 @@ func TestClaimHandlerAdmitsOneGoroutine(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if service.claimHandler() {
+			service.mu.Lock()
+			defer service.mu.Unlock()
+			if service.claimLocked() {
 				atomic.AddInt64(&claims, 1)
 			}
 		}()
@@ -148,9 +150,75 @@ func TestClaimHandlerAdmitsOneGoroutine(t *testing.T) {
 	}
 
 	service.releaseHandler()
-	if !service.claimHandler() {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if !service.claimLocked() {
 		t.Error("expected the handler to be claimable again after release")
 	}
+}
+
+func TestDrainOrStopExtendsOnKeepalive(t *testing.T) {
+	service := &Service{name: "svc", time: make(chan uint64, 1)}
+	service.time <- 42
+
+	stopped := false
+	extended, timeout := service.drainOrStop(func() { stopped = true })
+
+	if !extended {
+		t.Error("expected a pending keepalive to extend the timeout")
+	}
+	if timeout != 42 {
+		t.Errorf("expected the queued timeout 42, got %d", timeout)
+	}
+	if stopped {
+		t.Error("the service must not be stopped when a keepalive is pending")
+	}
+}
+
+func TestDrainOrStopReleasesHandlerOnlyAfterStopping(t *testing.T) {
+	service := &Service{name: "svc", time: make(chan uint64, 1)}
+	service.isHandled = true
+
+	stopped := false
+	extended, _ := service.drainOrStop(func() {
+		stopped = true
+		if !service.isHandled {
+			t.Error("handler was released before the stop completed")
+		}
+	})
+
+	if extended {
+		t.Error("expected the service to stop when no keepalive is pending")
+	}
+	if !stopped {
+		t.Error("expected the stop function to run")
+	}
+
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.isHandled {
+		t.Error("expected the handler to be released once the service is stopped")
+	}
+}
+
+func TestDrainOrStopHoldsLockWhileStopping(t *testing.T) {
+	service := &Service{name: "svc", time: make(chan uint64, 1)}
+	acquired := make(chan struct{})
+
+	service.drainOrStop(func() {
+		go func() {
+			service.mu.Lock()
+			service.mu.Unlock()
+			close(acquired)
+		}()
+		select {
+		case <-acquired:
+			t.Error("a request observed the service while it was being stopped")
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+
+	<-acquired
 }
 
 func parseQuery(t *testing.T, query string) (string, uint64, string, string, error) {
@@ -208,5 +276,32 @@ func TestParseParamsReadsValidRequest(t *testing.T) {
 	}
 	if name != "myapp" || timeout != 60 || host != "app.example.com" || path != "/health" {
 		t.Errorf("got name=%q timeout=%d host=%q path=%q", name, timeout, host, path)
+	}
+}
+
+func TestStatusMapping(t *testing.T) {
+	cases := []struct {
+		name   string
+		states []string
+		want   Status
+	}{
+		{"all running is up", []string{"running", "running"}, UP},
+		{"any restarting is starting", []string{"running", "restarting"}, STARTING},
+		{"created needs starting", []string{"created"}, DOWN},
+		{"exited needs starting", []string{"running", "exited"}, DOWN},
+		{"dead needs starting", []string{"dead"}, DOWN},
+		{"no containers is unknown", []string{}, UNKNOWN},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			containers := make([]containertypes.Summary, 0, len(tc.states))
+			for _, state := range tc.states {
+				containers = append(containers, containertypes.Summary{State: state})
+			}
+			if got := statusOf(containers); got != tc.want {
+				t.Errorf("states %v gave %q, want %q", tc.states, got, tc.want)
+			}
+		})
 	}
 }
