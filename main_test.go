@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types"
 )
@@ -147,5 +150,63 @@ func TestClaimHandlerAdmitsOneGoroutine(t *testing.T) {
 	service.releaseHandler()
 	if !service.claimHandler() {
 		t.Error("expected the handler to be claimable again after release")
+	}
+}
+
+func parseQuery(t *testing.T, query string) (string, uint64, string, string, error) {
+	t.Helper()
+	return parseParams(httptest.NewRequest(http.MethodGet, "/api/?"+query, nil))
+}
+
+func TestParseParamsRejectsNegativeTimeout(t *testing.T) {
+	_, timeout, _, _, err := parseQuery(t, "name=myapp&timeout=-1")
+	if err == nil {
+		t.Fatal("expected a negative timeout to be rejected")
+	}
+	if timeout != 0 {
+		t.Errorf("expected timeout 0 on rejection, got %d", timeout)
+	}
+}
+
+func TestNegativeTimeoutNoLongerInvertsSleep(t *testing.T) {
+	parsed := -1
+	if d := time.Duration(uint64(parsed)) * time.Second; d >= 0 {
+		t.Skip("platform does not reproduce the original wraparound")
+	}
+	if _, _, _, _, err := parseQuery(t, "name=myapp&timeout=-1"); err == nil {
+		t.Error("a timeout that wraps to a negative duration must not be accepted")
+	}
+}
+
+func TestParseParamsRejectsOversizedTimeout(t *testing.T) {
+	_, _, _, _, err := parseQuery(t, fmt.Sprintf("name=myapp&timeout=%d", maxTimeout+1))
+	if err == nil {
+		t.Fatal("expected an oversized timeout to be rejected")
+	}
+}
+
+func TestParseParamsAcceptsMaxTimeout(t *testing.T) {
+	_, timeout, _, _, err := parseQuery(t, fmt.Sprintf("name=myapp&timeout=%d", maxTimeout))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if d := time.Duration(timeout) * time.Second; d <= 0 {
+		t.Errorf("maxTimeout must stay positive as a Duration, got %v", d)
+	}
+}
+
+func TestParseParamsRejectsNonNumericTimeout(t *testing.T) {
+	if _, _, _, _, err := parseQuery(t, "name=myapp&timeout=abc"); err == nil {
+		t.Error("expected a non-numeric timeout to be rejected")
+	}
+}
+
+func TestParseParamsReadsValidRequest(t *testing.T) {
+	name, timeout, host, path, err := parseQuery(t, "name=myapp&timeout=60&host=app.example.com&path=%2Fhealth")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "myapp" || timeout != 60 || host != "app.example.com" || path != "/health" {
+		t.Errorf("got name=%q timeout=%d host=%q path=%q", name, timeout, host, path)
 	}
 }

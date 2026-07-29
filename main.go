@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -29,6 +30,10 @@ const (
 	// UNKNOWN represents a service for which the docker status is not know
 	UNKNOWN Status = "unknown"
 )
+
+// maxTimeout is the largest number of seconds that still fits in a
+// time.Duration once multiplied out to nanoseconds.
+const maxTimeout = uint64(math.MaxInt64 / time.Second)
 
 // Service holds all information related to a service
 type Service struct {
@@ -130,11 +135,14 @@ func parseParams(r *http.Request) (string, uint64, string, string, error) {
 	if err != nil {
 		return "", 0, "", "", nil
 	}
-	serviceTimeout, err := strconv.Atoi(timeoutString)
+	serviceTimeout, err := strconv.ParseUint(timeoutString, 10, 64)
 	if err != nil {
-		return "", 0, "", "", fmt.Errorf("timeout should be an integer")
+		return "", 0, "", "", fmt.Errorf("timeout should be a positive integer")
 	}
-	return serviceName, uint64(serviceTimeout), serviceHost, servicePath, nil
+	if serviceTimeout > maxTimeout {
+		return "", 0, "", "", fmt.Errorf("timeout must be at most %d seconds", maxTimeout)
+	}
+	return serviceName, serviceTimeout, serviceHost, servicePath, nil
 }
 
 func GetOrCreateService(name string, timeout uint64, host, path string, client *client.Client) (*Service, error) {
