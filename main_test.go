@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	containertypes "github.com/docker/docker/api/types/container"
 )
 
-func labelled(labels map[string]string) types.Container {
-	return types.Container{Labels: labels}
+func labelled(labels map[string]string) containertypes.Summary {
+	return containertypes.Summary{Labels: labels}
 }
 
 func TestPrefixMatch(t *testing.T) {

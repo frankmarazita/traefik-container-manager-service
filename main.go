@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 )
@@ -285,7 +285,7 @@ func (service *Service) startContainers(client *client.Client) error {
 	}
 	for _, container := range containers {
 		if container.State != "running" {
-			if err := client.ContainerStart(ctx, container.ID, types.ContainerStartOptions{}); err != nil {
+			if err := client.ContainerStart(ctx, container.ID, containertypes.StartOptions{}); err != nil {
 				return err
 			}
 		}
@@ -302,7 +302,7 @@ func (service *Service) stopContainers(client *client.Client) error {
 	for _, container := range containers {
 		fmt.Println(container.Image, container.State)
 		if container.State == "running" {
-			if err := client.ContainerStop(ctx, container.ID, nil); err != nil {
+			if err := client.ContainerStop(ctx, container.ID, containertypes.StopOptions{}); err != nil {
 				return err
 			}
 		}
@@ -317,7 +317,7 @@ func prefixMatch(requested, label string) bool {
 	return strings.HasPrefix(requested, label) || strings.HasPrefix(label, requested)
 }
 
-func (service *Service) matches(container types.Container) bool {
+func (service *Service) matches(container containertypes.Summary) bool {
 	if service.name != "" && strings.EqualFold(service.name, container.Labels["traefik-container-manager.name"]) {
 		return true
 	}
@@ -327,15 +327,15 @@ func (service *Service) matches(container types.Container) bool {
 	return prefixMatch(service.path, container.Labels["traefik-container-manager.path"])
 }
 
-func (service *Service) getDockerContainers(ctx context.Context, client *client.Client) ([]types.Container, error) {
-	opts := types.ContainerListOptions{All: true}
+func (service *Service) getDockerContainers(ctx context.Context, client *client.Client) ([]containertypes.Summary, error) {
+	opts := containertypes.ListOptions{All: true}
 	opts.Filters = filters.NewArgs()
 	opts.Filters.Add("label", "traefik-container-manager.name")
 	containers, err := client.ContainerList(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	requiredContainers := make([]types.Container, 0)
+	requiredContainers := make([]containertypes.Summary, 0)
 	for _, container := range containers {
 		if service.matches(container) {
 			requiredContainers = append(requiredContainers, container)
