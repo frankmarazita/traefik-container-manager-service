@@ -274,38 +274,36 @@ func (service *Service) stopContainers(client *client.Client) error {
 	return nil
 }
 
+func prefixMatch(requested, label string) bool {
+	if requested == "" || label == "" {
+		return false
+	}
+	return strings.HasPrefix(requested, label) || strings.HasPrefix(label, requested)
+}
+
+func (service *Service) matches(container types.Container) bool {
+	if service.name != "" && strings.EqualFold(service.name, container.Labels["traefik-container-manager.name"]) {
+		return true
+	}
+	if prefixMatch(service.host, container.Labels["traefik-container-manager.host"]) {
+		return true
+	}
+	return prefixMatch(service.path, container.Labels["traefik-container-manager.path"])
+}
+
 func (service *Service) getDockerContainers(ctx context.Context, client *client.Client) ([]types.Container, error) {
 	opts := types.ContainerListOptions{All: true}
 	opts.Filters = filters.NewArgs()
 	opts.Filters.Add("label", "traefik-container-manager.name")
-	containers, err := client.ContainerList(context.Background(), opts)
-	fmt.Println("Containers", containers)
-	requiredContainers := make([]types.Container, 0)
-	for _, container := range containers {
-		labelName := container.Labels["traefik-container-manager.name"]
-		if strings.EqualFold(service.name, labelName) {
-			fmt.Printf("Using name: %s\n", service.name)
-			requiredContainers = append(requiredContainers, container)
-			continue
-		}
-		if labelHost, ok := container.Labels["traefik-container-manager.host"]; ok {
-			if strings.HasPrefix(service.host, labelHost) || strings.HasPrefix(labelHost, service.host) {
-				fmt.Printf("Using host: %s\n", service.host)
-				requiredContainers = append(requiredContainers, container)
-			}
-			continue
-		}
-
-		if labelPath, ok := container.Labels["traefik-container-manager.path"]; ok {
-			if strings.HasPrefix(service.path, labelPath) || strings.HasPrefix(labelPath, service.path) {
-				fmt.Printf("Using path: %s\n", service.path)
-				requiredContainers = append(requiredContainers, container)
-			}
-			continue
-		}
-	}
+	containers, err := client.ContainerList(ctx, opts)
 	if err != nil {
 		return nil, err
+	}
+	requiredContainers := make([]types.Container, 0)
+	for _, container := range containers {
+		if service.matches(container) {
+			requiredContainers = append(requiredContainers, container)
+		}
 	}
 	if len(requiredContainers) == 0 {
 		return requiredContainers, fmt.Errorf("no containers found")
