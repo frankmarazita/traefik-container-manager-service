@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -36,10 +37,34 @@ type Service struct {
 	host      string
 	path      string
 	time      chan uint64
+	mu        sync.Mutex
 	isHandled bool
 }
 
-var services = map[string]*Service{}
+// claimHandler reports whether the caller is the goroutine responsible for
+// stopping the service, so only one stopAfterTimeout runs per service.
+func (service *Service) claimHandler() bool {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.isHandled {
+		return false
+	}
+	service.isHandled = true
+	return true
+}
+
+// releaseHandler hands responsibility back once the service has been stopped,
+// so a later request can start it again.
+func (service *Service) releaseHandler() {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.isHandled = false
+}
+
+var (
+	servicesMu sync.Mutex
+	services   = map[string]*Service{}
+)
 
 func main() {
 	fmt.Println("Server listening on port 10000.")
@@ -115,12 +140,11 @@ func parseParams(r *http.Request) (string, uint64, string, string, error) {
 func GetOrCreateService(name string, timeout uint64, host, path string, client *client.Client) (*Service, error) {
 	if name == "generic-container-manager" {
 		checkerService := Service{
-			name:      name,
-			timeout:   timeout,
-			host:      host,
-			path:      path,
-			time:      make(chan uint64, 1),
-			isHandled: false,
+			name:    name,
+			timeout: timeout,
+			host:    host,
+			path:    path,
+			time:    make(chan uint64, 1),
 		}
 		ctx := context.Background()
 		containers, err := checkerService.getDockerContainers(ctx, client)
@@ -129,16 +153,18 @@ func GetOrCreateService(name string, timeout uint64, host, path string, client *
 		}
 		name = containers[0].Labels["traefik-container-manager.name"]
 	}
-	if services[name] != nil {
-		return services[name], nil
+
+	servicesMu.Lock()
+	defer servicesMu.Unlock()
+	if service, ok := services[name]; ok {
+		return service, nil
 	}
 	service := &Service{
-		name:      name,
-		timeout:   timeout,
-		host:      host,
-		path:      path,
-		time:      make(chan uint64, 1),
-		isHandled: false,
+		name:    name,
+		timeout: timeout,
+		host:    host,
+		path:    path,
+		time:    make(chan uint64, 1),
 	}
 
 	services[name] = service
@@ -154,8 +180,7 @@ func (service *Service) HandleServiceState(cli *client.Client) (string, error) {
 	}
 	if status == UP {
 		fmt.Printf("- Service %v is up\n", service.name)
-		fmt.Println(service)
-		if !service.isHandled {
+		if service.claimHandler() {
 			go service.stopAfterTimeout(cli)
 		}
 		select {
@@ -166,10 +191,9 @@ func (service *Service) HandleServiceState(cli *client.Client) (string, error) {
 		return "started", nil
 	} else if status == STARTING {
 		fmt.Printf("- Service %v is starting\n", service.name)
-		if err != nil {
-			return "", err
+		if service.claimHandler() {
+			go service.stopAfterTimeout(cli)
 		}
-		go service.stopAfterTimeout(cli)
 		return "starting", nil
 	} else if status == DOWN {
 		fmt.Printf("- Service %v is down\n", service.name)
@@ -207,14 +231,18 @@ func (service *Service) getStatus(client *client.Client) (Status, error) {
 
 func (service *Service) start(client *client.Client) {
 	fmt.Printf("Starting service %s\n", service.name)
-	service.isHandled = true
 	service.startContainers(client)
-	go service.stopAfterTimeout(client)
-	service.time <- service.timeout
+	if service.claimHandler() {
+		go service.stopAfterTimeout(client)
+	}
+	select {
+	case service.time <- service.timeout:
+	default:
+	}
 }
 
 func (service *Service) stopAfterTimeout(client *client.Client) {
-	service.isHandled = true
+	defer service.releaseHandler()
 	fmt.Println("In stopAfterTimeout")
 
 	if timeout, ok := <-service.time; ok {

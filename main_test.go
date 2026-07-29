@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/docker/docker/api/types"
@@ -76,5 +79,73 @@ func TestServiceMatchesEmptyNameLabel(t *testing.T) {
 
 	if service.matches(container) {
 		t.Error("an empty service name must not match an empty name label")
+	}
+}
+
+func TestGetOrCreateServiceIsRaceFree(t *testing.T) {
+	servicesMu.Lock()
+	services = map[string]*Service{}
+	servicesMu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if _, err := GetOrCreateService(fmt.Sprintf("svc-%d", n%5), 60, "", "", nil); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	servicesMu.Lock()
+	defer servicesMu.Unlock()
+	if len(services) != 5 {
+		t.Errorf("expected 5 distinct services, got %d", len(services))
+	}
+}
+
+func TestGetOrCreateServiceReturnsSameInstance(t *testing.T) {
+	servicesMu.Lock()
+	services = map[string]*Service{}
+	servicesMu.Unlock()
+
+	first, err := GetOrCreateService("dupe", 60, "", "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	second, err := GetOrCreateService("dupe", 120, "", "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if first != second {
+		t.Error("expected the cached service instance to be reused")
+	}
+}
+
+func TestClaimHandlerAdmitsOneGoroutine(t *testing.T) {
+	service := &Service{name: "claimed", time: make(chan uint64, 1)}
+
+	var claims int64
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if service.claimHandler() {
+				atomic.AddInt64(&claims, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt64(&claims); got != 1 {
+		t.Errorf("expected exactly 1 claim, got %d", got)
+	}
+
+	service.releaseHandler()
+	if !service.claimHandler() {
+		t.Error("expected the handler to be claimable again after release")
 	}
 }
